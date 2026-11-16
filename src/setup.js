@@ -345,18 +345,55 @@ async function stepCodexAuth() {
 async function stepShizuku() {
   const wrapper = '#!/bin/sh\nexec /usr/local/bin/node /opt/ondev/bin/shizuku-client.mjs "$@"\n';
   const cliChanged = writeFile('/usr/local/bin/shizuku', wrapper, 0o755);
-  const skill = fs.readFileSync('/opt/ondev/skills/shizuku/SKILL.md', 'utf8');
-  const skillChanged = writeFile('/root/.bb/skills/shizuku/SKILL.md', skill);
+  const skillChanged = installSkills();
   return {
     changed: cliChanged || skillChanged,
-    detail: 'shizuku CLI + skill'
+    detail: 'shizuku CLI + skills'
   };
+}
+
+const SKILL_ROOTS = [
+  '/root/.bb/skills',
+  '/root/.config/opencode/skills',
+  '/root/.agents/skills',
+  '/root/.codex/skills',
+];
+
+function installSkills() {
+  const source = '/opt/ondev/skills';
+  let changed = false;
+  for (const name of fs.existsSync(source) ? fs.readdirSync(source) : []) {
+    const skillDir = path.join(source, name);
+    if (!fs.statSync(skillDir).isDirectory()) continue;
+    for (const root of SKILL_ROOTS) {
+      const target = path.join(root, name);
+      fs.mkdirSync(target, { recursive: true });
+      for (const entry of fs.readdirSync(skillDir, { withFileTypes: true })) {
+        const from = path.join(skillDir, entry.name);
+        if (entry.isDirectory()) {
+          copyTree(from, path.join(target, entry.name));
+          changed = true;
+          continue;
+        }
+        const content = fs.readFileSync(from);
+        const to = path.join(target, entry.name);
+        const previous = fs.existsSync(to) ? fs.readFileSync(to) : null;
+        if (previous === null || !previous.equals(content)) {
+          fs.writeFileSync(to, content, { mode: entry.name.endsWith('.mjs') ? 0o755 : 0o644 });
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed;
 }
 
 const AGENT_GUIDE = [
   'You run inside the Codex ondev app on the user\'s Android phone. To see phone files or control apps, use Shizuku (the shizuku skill). Run `shizuku status` first. If it isn\'t connected, say so in one or two plain sentences, with no jargon or paths, and give both links: Google Play https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api and GitHub https://github.com/RikkaApps/Shizuku/releases.',
   '',
   'Don\'t say "this environment" or talk about workspace paths unless asked.',
+  '',
+  'After you finish building a new runnable game, app or website for the user, ask once: "Want me to publish it to GitHub and omgithub?" If yes, use the publish skill (it runs gh login first if needed). Do not ask for small fixes or edits, ask only once per project, and if the user says no, don\'t ask again for that project.',
   ''
 ].join('\n');
 
