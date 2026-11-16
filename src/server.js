@@ -69,6 +69,63 @@ async function hasActiveTurns() {
   return active;
 }
 
+const acpRetryAt = new Map();
+
+function looksLikeAcpExit(text) {
+  const lower = String(text || '').toLowerCase();
+  return lower.includes('acp agent') || lower.includes('opencode acp') ||
+    (lower.includes('exited') && lower.includes('opencode'));
+}
+
+async function retryFailedAcpThreads() {
+  if (process.env.ONDEV_ACP_RETRY === '0') return;
+  const list = await supervisor.runCli('bb', ['thread', 'list', '--json'], 20000);
+  if (!list.ok) return;
+  let threads = [];
+  try {
+    threads = JSON.parse(list.stdout);
+  } catch {
+    return;
+  }
+  for (const thread of threads) {
+    const id = thread && thread.id;
+    if (!id) continue;
+    const status = (thread.runtime && thread.runtime.displayStatus) || thread.status;
+    if (status !== 'error') continue;
+    const last = acpRetryAt.get(id) || 0;
+    if (Date.now() - last < 10 * 60 * 1000) continue;
+    const log = await supervisor.runCli('bb', ['thread', 'log', id, '--json'], 20000);
+    if (!log.ok) continue;
+    const tail = log.stdout.slice(-4000);
+    if (!looksLikeAcpExit(tail)) continue;
+    let events = [];
+    try {
+      events = JSON.parse(log.stdout);
+    } catch {
+      continue;
+    }
+    const lastUser = [...events].reverse().find((event) => {
+      const data = (event && event.data) || {};
+      return data.role === 'user' && typeof data.text === 'string' && data.text.trim();
+    });
+    const text = lastUser && lastUser.data && lastUser.data.text;
+    if (!text) continue;
+    acpRetryAt.set(id, Date.now());
+    const created = await supervisor.runCli('bb', ['thread', 'queue', 'create', id, text, '--json'], 20000);
+    if (!created.ok) {
+      log('configure', 'acp retry: could not queue for ' + id + ': ' + (created.stderr || 'failed'));
+      continue;
+    }
+    let queuedId = '';
+    try {
+      queuedId = JSON.parse(created.stdout).id || '';
+    } catch { /* ignore */ }
+    if (!queuedId) continue;
+    const sent = await supervisor.runCli('bb', ['thread', 'queue', 'send', id, queuedId], 20000);
+    log('configure', 'acp retry for ' + id + ': ' + (sent.ok ? 're-sent the last prompt' : (sent.stderr || 'failed')));
+  }
+}
+
 function serveStatic(res, pathname, headOnly) {
   const normalized = pathname === '/' ? '/index.html' : pathname;
   const filePath = path.normalize(path.join(publicDir, normalized));
@@ -182,6 +239,10 @@ server.listen(config.port, config.host, () => {
   log('launcher listening on http://' + config.host + ':' + config.port);
   boot().catch((error) => log('boot failed: ' + error.message));
 });
+
+setInterval(() => {
+  retryFailedAcpThreads().catch((error) => log('acp retry failed: ' + error.message));
+}, 30000).unref();
 
 async function shutdown() {
   try { await supervisor.stop(); } catch { /* ignore */ }
